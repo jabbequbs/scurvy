@@ -4,6 +4,7 @@ import argparse
 import base64
 import hashlib
 import importlib
+import importlib.util
 import json
 import logging
 import mimetypes
@@ -24,6 +25,9 @@ from wsgiref.util import shift_path_info
 response_codes = {k:"%s %s" % (int(k), v[0]) for k,v in BaseHTTPRequestHandler.responses.items()}
 mimetypes.types_map[".js"] = "application/javascript"
 
+class G:
+    debug = False
+
 contents_page = """\
 <!DOCTYPE html>
 <html>
@@ -33,6 +37,7 @@ contents_page = """\
   <title>Folder contents</title>
   <style type="text/css">
     * { font-family: Verdana, sans-serif; line-height: 1.3; }
+    body { max-width: 1000px; margin: 20px auto; }
     table { border-collapse: collapse; width: 100%%; border: 1px solid silver; }
     td { padding: 8px; border-top: 1px solid silver; border-bottom: 1px solid silver; }
     td:nth-child(2) { width: 100%%; }
@@ -138,7 +143,7 @@ def empty_response(start_response, code, headers=None):
     start_response(response_codes[code], headers or [])
     return []
 
-class StaticFileApp(object):
+class StaticFileApp:
     def __init__(self, root, browse=False, cgi=False):
         logging.debug("Creating StaticFileApp at %s" % root)
         self.root = os.path.abspath(root)
@@ -211,7 +216,7 @@ class StaticFileApp(object):
         else:
             return text_response(start_response, 404, [b"404 Not found"])
 
-class CGIApp(object):
+class CGIApp:
     def __init__(self, handler):
         logging.debug("Creating CGIApp with %s" % handler)
         self.command = shlex.split(handler, posix=False)
@@ -251,18 +256,26 @@ class CGIApp(object):
 
         if stderr:
             try:
-                stderr = stderr.decode("utf-8").strip().replace("\r\n", "\n")
+                stderrString = stderr.decode("utf-8").strip().replace("\r\n", "\n")
             except:
-                stderr = repr(stderr)
+                stderrString = repr(stderr)
             logging.error("CGI script: %s\n%s" % (self.command, "\n".join(
-                "  stderr: %s" % line for line in stderr.splitlines())))
+                "  stderr: %s" % line for line in stderrString.splitlines())))
 
         if worker.wait() == 0:
             newline = stdout.find(b"\n")
             if newline == -1:
                 logging.error("Failed to parse CGI output:")
                 logging.error(stdout)
-                return text_response(start_response, 500, [b"Failed to parse CGI output"])
+                if G.debug:
+                    try:
+                        stdoutString = stdout.decode("utf-8")
+                    except:
+                        stdoutString = repr(stdout)
+                    return text_response(start_response, 500,
+                        f"Failed to parse CGI output:\n\n{stdoutString}")
+                else:
+                    return text_response(start_response, 500, [b"Internal server error"])
             if stdout[newline-1] == ord("\r"):
                 newline = b"\r\n"
             else:
@@ -281,12 +294,59 @@ class CGIApp(object):
             start_response(status, headers)
             return [stdout]
         else:
-            return text_response(start_response, 500, [
-                b"The CGI script failed.",
-                b"\n\nstdout:\n", stdout or b"",
-                b"\n\nstderr:\n", stderr or b""])
+            if G.debug:
+                return text_response(start_response, 500, [
+                    b"The CGI script failed.",
+                    b"\n\nstdout:\n", stdout or b"",
+                    b"\n\nstderr:\n", stderr or b""])
+            else:
+                return text_response(start_response, 500, [b"Internal server error"])
 
-class HttpsMiddleware(object):
+class ReloadableWSGIApp:
+    def __init__(self, name):
+        self.name = name
+        self._load_application(self.name)
+
+    def _load_application(self, name, module=None):
+        vars(self).setdefault("timestamp", 0)
+        vars(self).setdefault("module", None)
+        try:
+            if not module and os.path.isfile(moduleName):
+                self.module = self._load_file(moduleName)
+            else:
+                if module:
+                    self.module = importlib.reload(module)
+                else:
+                    moduleName, application = name.rsplit(":", 1)
+                    self.module = importlib.import_module(moduleName)
+                    logging.debug(str(self.module))
+            self.application = getattr(self.module, application)
+        except Exception:
+            if G.debug:
+                from traceback import format_exc
+                details = f"An error occurred while (re)loading the application {name}:\n\n{format_exc().strip()}"
+                self.application = lambda e, s: text_response(s, 500, details)
+            else:
+                self.application = lambda e, s: text_response(
+                    s, 500, [b"Internal server error"])
+        else:
+            self.timestamp = os.path.getmtime(self.module.__file__)
+
+    def _load_file(self, filename):
+        module_name = os.path.basename(filename).rsplit(".", 1)[0]
+        spec = importlib.util.spec_from_file_location(module_name, filename)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def __call__(self, environ, start_response):
+        if not self.module or os.path.getmtime(self.module.__file__) != self.timestamp:
+            logging.debug(f"Reloading application {self.name}")
+            self._load_application(self.name, self.module)
+        return self.application(environ, start_response)
+
+class HttpsMiddleware:
     def __init__(self, app):
         self.app = app
 
@@ -295,93 +355,50 @@ class HttpsMiddleware(object):
         environ["wsgi.url_scheme"] = "https"
         return self.app(environ, start_response)
 
-class MasterApp(object):
-    def __init__(self, config):
-        if config.www:
-            self.root = StaticFileApp(config.www, config.browse, config.cgi)
-        else:
-            self.root = lambda e, r: text_response(r, 404, [b"No such application"])
-        self.paths = []
-        # path => (regex, set(authorizations))
-        self.authentication = {}
-        for entry in config.wsgi:
-            try:
-                path, handler_name = entry.split(maxsplit=1)
-                module, handler = handler_name.rsplit(".", maxsplit=1)
-                module = importlib.import_module(module)
-                handler = getattr(module, handler)
-            except Exception as e:
-                logging.error("Failed to load WSGI handler %s: %s" % (handler_name, e))
-            else:
-                self.paths.append((self._get_path_regex(path), handler))
-                logging.debug("Loaded WSGI application %s" % handler_name)
-        if config.basic_auth:
-            for entry in config.basic_auth:
-                parts = entry.strip().split()
-                if len(parts) == 2:
-                    if parts[0] not in self.authentication:
-                        self.authentication[parts[0]] = (
-                            self._get_path_regex(parts[0]), set())
-                    self.authentication[parts[0]][1].add(parts[1])
-                else:
-                    logging.error("Invalid config for basic auth: %s" % entry)
-        if config.demo:
-            self.paths.append(
-                    (self._get_path_regex("**/demo_app"), demo_app))
-
-    def _get_path_regex(self, pattern):
-        regex = re.escape(pattern).replace(r"\*\*", r"(.*)")
-        regex = regex.replace(r"\*", r"([^/]*)")+r"(\b|$)"
-        logging.debug("Regex (caseless): %s => %s" % (pattern, regex))
-        return re.compile(regex, re.I)
+class DelegatorMiddleware:
+    def __init__(self, routes):
+        self.routes = routes
 
     def __call__(self, environ, start_response):
-        for pattern in self.authentication:
-            match = self.authentication[pattern][0].match(environ["PATH_INFO"])
-            if match:
-                logging.debug("Authenticating (matched %s)" % pattern)
-                user_auth = environ.get("HTTP_AUTHORIZATION")
-                if not user_auth:
-                    return text_response(start_response, 401, [b"401 Unauthorized"],
-                        [("WWW-Authenticate", "Basic")])
-                parts = user_auth.split()
-                if len(parts) != 2 or parts[0] != "Basic":
-                    return text_response(start_response, 401, [b"401 Unauthorized"],
-                        [("WWW-Authenticate", "Basic")])
-                user_auth = base64.b64decode(parts[1].encode("utf-8"))
-                users = self.authentication[pattern][1]
-                user_auth_hash = hashlib.sha256(user_auth).hexdigest()
-                if user_auth_hash not in users:
-                    return text_response(start_response, 401, [b"401 Unauthorized"],
-                        [("WWW-Authenticate", "Basic")])
-                else:
-                    if not environ.get("REMOTE_USER"):
-                        environ["REMOTE_USER"] = user_auth.split(b":")[0].decode("utf-8")
+        for path, application in self.routes:
+            if environ["PATH_INFO"].lower().startswith(path.lower()):
+                # /abc should match /abc/def but not /abcdef
+                remainder = environ["PATH_INFO"][len(path):]
+                if remainder and remainder[0] != "/":
+                    continue
+                environ["SCRIPT_NAME"] += path
+                environ["PATH_INFO"] = remainder or "/"
+                logging.debug(f"Using application {application} with PATH_INFO = {environ['PATH_INFO']}, SCRIPT_NAME = {environ['SCRIPT_NAME']}")
+                return application(environ, start_response)
+        return text_response(start_response, 404, [b"Not found"])
 
-        for pattern, app in self.paths:
-            match = pattern.match(environ["PATH_INFO"])
-            if match:
-                logging.debug("Found matching application (%s, %s)" % (pattern, app))
-                script_name = environ["PATH_INFO"][:match.end()]
-                path_info = environ["PATH_INFO"][match.end():] or "/"
-                environ["SCRIPT_NAME"] += script_name
-                environ["PATH_INFO"] = path_info
-                if not environ["PATH_INFO"].startswith("/"):
-                    environ["PATH_INFO"] = "/" + environ["PATH_INFO"]
-                try:
-                    result = app(environ, start_response)
-                except Exception as e:
-                    from traceback import format_exc
-                    logging.error(format_exc().strip())
-                    return text_response(start_response, 500, [b"Server error"])
-                else:
-                    if result is None:
-                        logging.error("No result from %s" % app)
-                        return text_response(start_response, 500, [b"No result"])
-                    return result
+class BasicAuthMiddleware(DelegatorMiddleware):
+    """userfile is a file with sha256(username:password) on each line"""
 
-        logging.debug("Using root application %s" % self.root)
-        return self.root(environ, start_response)
+    def __init__(self, userfile, routes):
+        super().__init__(routes)
+        with open(userfile) as f:
+            self.authentication = set(line.strip() for line in f
+                if line and line[0] != "#")
+
+    def __call__(self, environ, start_response):
+        user_auth = environ.get("HTTP_AUTHORIZATION")
+        if not user_auth:
+            return text_response(start_response, 401, [b"401 Unauthorized"],
+                [("WWW-Authenticate", "Basic")])
+        parts = user_auth.split()
+        if len(parts) != 2 or parts[0] != "Basic":
+            return text_response(start_response, 401, [b"401 Unauthorized"],
+                [("WWW-Authenticate", "Basic")])
+        user_auth = base64.b64decode(parts[1].encode("utf-8"))
+        user_auth_hash = hashlib.sha256(user_auth).hexdigest()
+        if user_auth_hash not in self.authentication:
+            return text_response(start_response, 401, [b"401 Unauthorized"],
+                [("WWW-Authenticate", "Basic")])
+        else:
+            if not environ.get("REMOTE_USER"):
+                environ["REMOTE_USER"] = user_auth.split(b":")[0].decode("utf-8")
+        return super().__call__(environ, start_response)
 
 class ThreadPoolWSGIServer(WSGIServer):
     _futures = {}
@@ -411,7 +428,6 @@ class ThreadPoolWSGIServer(WSGIServer):
 
 class LoggingHandler(WSGIRequestHandler):
     # To log requests in a different format, override log_request(self, *args)
-
     def log_message(self, fmt, *args):
         logging.info("%s - %s" % (
             self.address_string(),
@@ -429,38 +445,43 @@ class LoggingHandler(WSGIRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--www", type=os.path.abspath, metavar="ROOT")
-    parser.add_argument("--cgi", action="store_true",
-        help="Specify whether files in a 'cgi-bin' folder should be treated as CGI scripts")
-    parser.add_argument("--certfile", type=os.path.abspath)
-    parser.add_argument("--port", default=8000, type=int)
-    # TODO: browse can be specified multiple times, with a path pattern argument
-    parser.add_argument("--browse", action="store_true")
-    parser.add_argument("--external", action="store_true",
+
+    group = parser.add_argument_group("Networking")
+    group.add_argument("--certfile", type=os.path.abspath,
+        help="A .pem certificate to use for HTTPS")
+    group.add_argument("--port", default=8000, type=int,
+        help="The port to serve from (default = %(default)s)")
+    group.add_argument("--external", action="store_true",
         help="Host on 0.0.0.0 instead of loop back address")
-    parser.add_argument("--logfile", type=os.path.abspath)
-    parser.add_argument("--log-level", choices=("DEBUG", "INFO"), default="INFO")
-    parser.add_argument("--demo", action="store_true",
-        help="Mount wsgiref.simple_server.demo_app at **/demo_app")
-    parser.add_argument("--libs", action="append", default=[],
+
+    group = parser.add_argument_group("Logging")
+    group.add_argument("--logfile", type=os.path.abspath,
+        help="The log file location.  Default is stdout")
+    group.add_argument("--log-level", choices=("DEBUG", "INFO"), default="INFO",
+        help="The starting log level.  (default = %(default)s)")
+
+    group = parser.add_argument_group("Applications")
+    group.add_argument("--libs", action="append", default=[],
         help="Specify a directory to add to sys.path.  Can be specified multiple times")
-    parser.add_argument("--wsgi", default=[], action="append",
-        help="Specify a pattern and a WSGI application to handle matching request")
-    parser.add_argument("--basic-auth", default=[], action="append",
-        help='Format like "/web/path sha256(user:password)"')
-    parser.add_argument("--conf",
-        help="Specify a config file containing one option per line")
+    group.add_argument("--cgi", action="store_true",
+        help="When serving static files, enable CGI scripts in cgi-bin folders")
+    group.add_argument("--browse", action="store_true",
+        help="When serving static files, enable directory browsing")
+    group.add_argument("--debug", action="store_true",
+        help="Show error details and reload the WSGI application if its file changes")
+    parser_group = group.add_mutually_exclusive_group(required=True)
+    parser_group.add_argument("--wsgi",
+        help="File and application to run (filename.py:appName or modulename:appName)")
+    parser_group.add_argument("--www", type=os.path.abspath,
+        help="A folder to serve static files from")
     args = parser.parse_args()
 
-    if args.conf and os.path.isfile(args.conf):
-        conf_args = []
-        with open(args.conf) as f:
-            for line in f:
-                if line.strip().startswith("#"):
-                    continue
-                conf_args.extend(map(str.strip, line.split(maxsplit=1)))
-        args = parser.parse_args(sys.argv[1:]+conf_args)
-
+    # {'conf': None, 'certfile': None, 'port': 8001, 'external': False,
+    #  'logfile': None, 'log_level': 'INFO',
+    #  'libs': [], 'cgi': False, 'browse': False, 'debug': True, 'wsgi': 'scurvy-config.py:app', 'www': None}
+    G.debug = args.debug
+    if G.debug:
+        args.log_level = "DEBUG"
     logging_config = dict(
         stream=sys.stdout,
         format="%(levelno)s %(thread)s [%(asctime)s] [%(module)s] %(message)s",
@@ -472,8 +493,26 @@ def main():
 
     for lib in args.libs:
         sys.path.append(os.path.abspath(lib))
+    if args.wsgi:
+        if args.cgi or args.browse:
+            parser.error("--cgi and --browse cannot be specified when using --wsgi")
+        rootApp = ReloadableWSGIApp(args.wsgi)
+        if not G.debug:
+            rootApp = rootApp.application
+    elif args.www:
+        rootApp = StaticFileApp(args.www, args.browse, args.cgi)
 
-    app = MasterApp(args)
+    def errorHandlingWrapper(environ, start_response):
+        try:
+            return rootApp(environ, start_response)
+        except Exception as e:
+            if G.debug:
+                from traceback import format_exc
+                return text_response(start_response, 500, format_exc().strip())
+            else:
+                return text_response(start_response, 500, [b"Internal server error"])
+    app = errorHandlingWrapper
+
     if args.certfile:
         app = HttpsMiddleware(app)
     server_info = ("0.0.0.0" if args.external else "127.0.0.1",
@@ -486,6 +525,7 @@ def main():
         # doskey openssl="C:\Program Files\Git\mingw64\bin\openssl.exe" $*
         # openssl req -new -x509 -keyout server.pem -out server.pem -days 365 -nodes
         # use server.pem as certfile
+        # TODO: use SSLContext.wrap_socket instead
         if args.certfile:
             httpd.socket = ssl.wrap_socket(httpd.socket,
                 certfile=args.certfile, server_side=True)
