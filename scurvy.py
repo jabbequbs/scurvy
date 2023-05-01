@@ -176,7 +176,7 @@ class StaticFileApp:
             if not handler.lower().startswith(self.root.lower()):
                 return text_response(start_response, 404, [b"404 Not found"])
             elif not os.path.isfile(handler):
-                return text_response(start_response, 403, [b"Forbidden"])
+                return text_response(start_response, 404, [b"404 Not found"])
             if handler not in self.cgi_handlers:
                 self.cgi_handlers[handler] = CGIApp(handler)
             return self.cgi_handlers[handler](environ, start_response)
@@ -310,6 +310,7 @@ class ReloadableWSGIApp:
     def _load_application(self, name, module=None):
         vars(self).setdefault("timestamp", 0)
         vars(self).setdefault("module", None)
+        moduleName, application = name.rsplit(":", 1)
         try:
             if not module and os.path.isfile(moduleName):
                 self.module = self._load_file(moduleName)
@@ -322,9 +323,10 @@ class ReloadableWSGIApp:
                     logging.debug(str(self.module))
             self.application = getattr(self.module, application)
         except Exception:
+            from traceback import format_exc
+            details = f"An error occurred while (re)loading the application {name}:\n\n{format_exc().strip()}"
+            logging.error(details)
             if G.debug:
-                from traceback import format_exc
-                details = f"An error occurred while (re)loading the application {name}:\n\n{format_exc().strip()}"
                 self.application = lambda e, s: text_response(s, 500, details)
             else:
                 self.application = lambda e, s: text_response(
@@ -358,17 +360,22 @@ class HttpsMiddleware:
 class DelegatorMiddleware:
     def __init__(self, routes):
         self.routes = routes
+        for path, application in routes:
+            if path.endswith("/"):
+                logging.warning(f"Path {path}: SCRIPT_NAME and PATH_INFO will both have /")
 
     def __call__(self, environ, start_response):
         for path, application in self.routes:
             if environ["PATH_INFO"].lower().startswith(path.lower()):
                 # /abc should match /abc/def but not /abcdef
                 remainder = environ["PATH_INFO"][len(path):]
-                if remainder and remainder[0] != "/":
+                if remainder and remainder[0] != "/" and path[-1] != "/":
                     continue
                 environ["SCRIPT_NAME"] += path
                 environ["PATH_INFO"] = remainder or "/"
-                logging.debug(f"Using application {application} with PATH_INFO = {environ['PATH_INFO']}, SCRIPT_NAME = {environ['SCRIPT_NAME']}")
+                if environ["PATH_INFO"][0] != "/":
+                    environ["PATH_INFO"] = "/" + environ["PATH_INFO"]
+                logging.debug(f"Using application {application} with SCRIPT_NAME = {environ['SCRIPT_NAME']}, PATH_INFO = {environ['PATH_INFO']}")
                 return application(environ, start_response)
         return text_response(start_response, 404, [b"Not found"])
 
@@ -443,6 +450,28 @@ class LoggingHandler(WSGIRequestHandler):
         env["REMOTE_PORT"] = str(self.client_address[1])
         return env
 
+def serve(host, port, app, certfile=None, debug=False):
+    G.debug = debug
+
+    if certfile:
+        app = HttpsMiddleware(app)
+    server_info = (host, port, app, ThreadPoolWSGIServer, LoggingHandler)
+    logging.info("Making server...")
+    with make_server(*server_info) as httpd:
+        logging.info("Serving at %s:%s" % (server_info[0], server_info[1]))
+        # https://gist.github.com/dergachev/7028596
+        # doskey openssl="C:\Program Files\Git\mingw64\bin\openssl.exe" $*
+        # openssl req -new -x509 -keyout server.pem -out server.pem -days 365 -nodes
+        # use server.pem as certfile
+        # TODO: use SSLContext.wrap_socket instead
+        if certfile:
+            httpd.socket = ssl.wrap_socket(httpd.socket,
+                certfile=certfile, server_side=True)
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            logging.info("Interrupt received, exiting")
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -476,9 +505,6 @@ def main():
         help="A folder to serve static files from")
     args = parser.parse_args()
 
-    # {'conf': None, 'certfile': None, 'port': 8001, 'external': False,
-    #  'logfile': None, 'log_level': 'INFO',
-    #  'libs': [], 'cgi': False, 'browse': False, 'debug': True, 'wsgi': 'scurvy-config.py:app', 'www': None}
     G.debug = args.debug
     if G.debug:
         args.log_level = "DEBUG"
@@ -513,26 +539,8 @@ def main():
                 return text_response(start_response, 500, [b"Internal server error"])
     app = errorHandlingWrapper
 
-    if args.certfile:
-        app = HttpsMiddleware(app)
-    server_info = ("0.0.0.0" if args.external else "127.0.0.1",
-        args.port, app, ThreadPoolWSGIServer, LoggingHandler)
-    with make_server(*server_info) as httpd:
-        logging.info("Serving at %s:%s" % (server_info[0], server_info[1]))
-        if args.www:
-            logging.info("Serving from %s" % args.www)
-        # https://gist.github.com/dergachev/7028596
-        # doskey openssl="C:\Program Files\Git\mingw64\bin\openssl.exe" $*
-        # openssl req -new -x509 -keyout server.pem -out server.pem -days 365 -nodes
-        # use server.pem as certfile
-        # TODO: use SSLContext.wrap_socket instead
-        if args.certfile:
-            httpd.socket = ssl.wrap_socket(httpd.socket,
-                certfile=args.certfile, server_side=True)
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            logging.info("Interrupt received, exiting")
+    host = "0.0.0.0" if args.external else "127.0.0.1"
+    serve(host, args.port, app, args.certfile, G.debug)
 
 if __name__ == '__main__':
     main()
