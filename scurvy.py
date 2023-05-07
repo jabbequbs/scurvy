@@ -190,9 +190,35 @@ class StaticFileApp:
             mimetype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
             if mimetype.startswith("text/"):
                 mimetype += "; charset=utf-8"
-            start_response("200 OK", [("Content-Type", mimetype)])
-            with open(filename, "rb") as f:
-                return [f.read()]
+            if "HTTP_RANGE" in environ:
+                unit, ranges = environ["HTTP_RANGE"].split("=")
+                if unit.lower() != "bytes":
+                    return text_response(start_response, 416, [b"Non 'bytes' ranges not supported"])
+                ranges = [r.split("-") for r in ranges.split(", ")]
+                results = []
+                filesize = os.path.getsize(filename)
+                with open(filename, "rb") as f:
+                    for start, end in ranges:
+                        start, end = map(lambda n: int(n) if len(n) > 0 else None, (start, end))
+                        if end is not None and start is None and end < filesize:
+                            f.seek(filesize-end)
+                            results.append(f.read())
+                            break
+                        elif start is not None and end is None:
+                            f.seek(start)
+                            results.append(f.read())
+                        elif end > start < filesize:
+                            f.seek(start)
+                            # "Range: bytes=0-1" of b"AA" should return b"AA"
+                            results.append(f.read(end-start+1))
+                        else:
+                            return text_response(start_response, 416, [b"Invalid range request"])
+                start_response("216 Partial Content", [("Content-Type", mimetype)])
+                return results
+            else:
+                start_response("200 OK", [("Content-Type", mimetype)])
+                with open(filename, "rb") as f:
+                    return [f.read()]
         elif os.path.isdir(filename):
             if not environ["PATH_INFO"][-1] == "/":
                 return empty_response(start_response, 301,
